@@ -176,14 +176,16 @@ class MWS(object):
         if self._backend.token:
             params['MWSAuthToken'] = self._backend.token
         params.update(extra_data)
+        pool = self._backend.pool.get('amazon.control.request')
+        env = self._backend.env['amazon.control.request']
         try:
-            pool = self._backend.pool.get('amazon.control.request')
-            env = self._backend.env['amazon.control.request']
-            pool.use_quota_if_avaiable(env, request_name=extra_data.get('Action'))
-        except AssertionError, e:
-            error = MWSError(str(e.response.text))
-            error.response = e.response
+            pool.use_quota_if_avaiable(env, request_name=extra_data.get('Action'), backend_id=self._backend.id)
+        except AssertionError as ae:
+            error = MWSError(str(ae.response.text))
+            error.response = ae.response
             raise error
+        except Exception as e:
+            raise e
 
         request_description = '&'.join(['%s=%s' % (k, urllib.quote(params[k], safe='-_.~').encode('utf-8')) for k in sorted(params)])
         signature = self.calc_signature(method, request_description)
@@ -210,9 +212,11 @@ class MWS(object):
             except XMLError:
                 parsed_response = DataWrapper(data, response.headers)
 
-        except HTTPError, e:
-            error = MWSError(str(e.response.text))
-            error.response = e.response
+        except HTTPError as httpe:
+            error = MWSError(str(httpe.response.text))
+            error.response = httpe.response
+            if 'RequestThrottled' in error.response.text:
+                raise pool.throw_retry_exception_for_throttled(env, request_name=extra_data.get('Action'), backend_id=self._backend.id)
             raise error
 
         # Store the response object in the parsed_response for quick access
@@ -429,6 +433,10 @@ class Orders(MWS):
         return self.make_request(data)
 
     def get_order(self, amazon_order_ids):
+        """
+        :param amazon_order_ids: list of order ids, max 50
+        :return:
+        """
         data = dict(Action='GetOrder')
         data.update(self.enumerate_param('AmazonOrderId.Id.', amazon_order_ids))
         return self.make_request(data)

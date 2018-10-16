@@ -3,10 +3,11 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 import logging
+import random
 
 from odoo import models, fields, api
 from odoo.addons.component.core import Component
-from odoo.addons.queue_job.exception import FailedJobError, RetryableJobError
+from odoo.addons.queue_job.exception import RetryableJobError
 from odoo.addons.queue_job.job import job
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +54,12 @@ class AmazonProductProduct(models.Model):
     weight = fields.Float('Weight', default=0)
     width = fields.Float('Width', default=0)
 
+    # Min and max margin stablished for the calculation of the price on product and product price details if these do not be informed
+    # If these fields do not be informed, gets the margin limits of backend
+    change_prices = fields.Boolean('Change the prices', default=True)
+    min_margin = fields.Float('Minimal margin', default=None)
+    max_margin = fields.Float('Minimal margin', default=None)
+
     RECOMPUTE_QTY_STEP = 1000  # products at a time
 
     @job(default_channel='root.amazon')
@@ -62,12 +69,60 @@ class AmazonProductProduct(models.Model):
         try:
             result = _super.import_record(backend, external_id)
             if not result:
-                raise RetryableJobError('The product of the backend %s hasn\'t could not be imported. \n %s', backend.name, external_id, 60)
+                raise RetryableJobError(msg='The product of the backend %s hasn\'t could not be imported. \n %s' % (backend.name, external_id),
+                                        seconds=random.randint(90, 600))
         except Exception as e:
             if e.message.find('current transaction is aborted') > -1 or e.message.find('could not serialize access due to concurrent update') > -1:
                 raise RetryableJobError('A concurrent job is already exporting the same record '
-                                        '(%s). The job will be retried later.' % self.model._name, 60, True)
+                                        '(%s). The job will be retried later.' % self.model._name, random.randint(60, 300), True)
             raise e
+
+    @job(default_channel='root.amazon')
+    @api.model
+    def export_batch(self, backend):
+        '''
+        We will use this method to get the products, get their prices and their stocks and export this on Amazon
+        :param backend:
+        :return:
+        '''
+
+        if backend.sync_stock:
+            export_prod = []
+            products = self.env['amazon.product.product'].search([('backend_id', '=', backend.id)])
+
+            with backend.work_on(self._name) as work:
+                exporter_stock = work.component(usage='amazon.product.stock.exporter')
+                i = [detail for product in products for detail in product.product_product_market_ids if product.product_product_market_ids]
+                for detail in i:
+                    virtual_available = detail.product_id.odoo_id._compute_check_stock()
+                    export_prod.append({'sku':detail.sku, 'Quantity':0 if virtual_available<0 else virtual_available, 'id_mws':detail.marketplace_id.id_mws})
+
+                exporter_stock.run(export_prod)
+
+
+        if backend.change_prices and backend.min_margin and backend.max_margin:
+            export_prices = []
+            # TODO Get products that have stock to sell
+            products = self.env['amazon.product.product'].search([('backend_id', '=', backend.id)])
+
+            # TODO Get lowest prices and buybox of the products
+
+            # TODO Calc the price for the product, we need to have in mind the next tips
+            #   1. If we have the buybox we don't anything
+            #   2. if the lowest price is mine and the buybox is not mine, we need reduce the price
+            #   3.
+            with backend.work_on(self._name) as work:
+                exporter_stock = work.component(usage='product.price.exporter')
+                i = [detail for product in products for detail in product.product_product_market_ids if
+                     product.product_product_market_ids]
+                for detail in i:
+                    virtual_available = detail.product_id.odoo_id._compute_check_stock()
+                    export_prod.append(
+                        {'sku': detail.sku, 'Quantity': 0 if virtual_available < 0 else virtual_available,
+                         'id_mws': detail.marketplace_id.id_mws})
+
+                exporter_stock.run(export_prod)
+        return
 
 
 class ProductProductDetail(models.Model):
@@ -107,6 +162,11 @@ class ProductProductDetail(models.Model):
     lowest_shipping_price = fields.Float('Lower shipping price', required=False)
     merchant_shipping_group = fields.Char('Shipping template name')
 
+    # Min and max margin stablished for the calculation of the price on product and product price details if these do not be informed
+    change_prices = fields.Boolean('Change the prices', default=True)
+    min_margin = fields.Float('Minimal margin', default=None)
+    max_margin = fields.Float('Minimal margin', default=None)
+
 
 class ProductProduct(models.Model):
     _inherit = 'product.product'
@@ -116,6 +176,31 @@ class ProductProduct(models.Model):
         inverse_name='odoo_id',
         string='Amazon Bindings',
     )
+
+    @api.depends('qty_available', 'virtual_available', 'stock_quant_ids', 'stock_move_ids', 'outgoing_qty',
+                 'product_uom_qty', 'product_uom', 'route_id')
+    def _compute_check_stock(self):
+        qty_total_product = 0
+        # Add the virtual avaiable of the product itself
+        if self.virtual_available and self.virtual_available > 0:
+            qty_total_product = self.virtual_available
+        # Add the calc of the stock avaiable counting with the BoM stock
+        if self.bom_ids:
+
+            # if we have bom, we need to calculate the forecast stock
+            qty_bom_produced = None
+            for bom in self.bom_ids:
+
+                for line_bom in bom.bom_line_ids:
+                    # We are going to divide the product bom stock for quantity of bom
+                    aux = int(line_bom.product_id.virtual_available / line_bom.product_qty)
+                    # If is the first ocurrence or the calc of stock avaiable with this product is lower than we are saved, we udpated this field
+                    if qty_bom_produced == None or aux < qty_bom_produced:
+                        qty_bom_produced = aux
+
+            qty_total_product += qty_bom_produced if qty_bom_produced else 0
+
+        return qty_total_product
 
 
 class ProductPriceList(models.Model):
@@ -137,6 +222,20 @@ class AmazonProductUoM(models.Model):
 
     product_uom_id = fields.Many2one('product.uom', 'Product UoM')
     name = fields.Char()
+
+class AmazonHistoricProductPrice(models.Model):
+    _name ='amazon.historic.product.price'
+
+    product_detail = fields.Many2one('amazon.product.product.detail')
+    change_date = fields.Datetime('Time when my price change')
+    type_change = fields.Selection(selection=[('UP', 'UP'),
+                                              ('DOWN', 'DOWN'),
+                                              ('EQUAL', 'EQUAL'),])
+
+    before_price = fields.Float('Price before change')
+    after_price = fields.Float('Price after change')
+    competitor_price = fields.Float('Competitor price')
+    buybox_mine = fields.Boolean('Is the buybox mine when the price is changed')
 
 
 class ProductProductAdapter(Component):

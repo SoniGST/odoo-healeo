@@ -34,10 +34,15 @@
                 <group><field name="import_updated_sales_from_date"/></group>
                 <group><field name="sale_prefix"/></group>
                 <group><field name="warehouse_id"/></group>
+                <group><field name="change_prices"/></group>
+                <group name="min_margin" attrs="{'invisible': [('change_prices', '=', True)]}"><field name="min_margin"/></group>
+                <group name="max_margin" attrs="{'invisible': [('change_prices', '=', True)]}"><field name="max_margin"/></group>
                 <group><field name="fba_warehouse_id"/></group>
                 <group><field name="marketplace_ids"/></group>
                 <footer>
-                    <button name="%(action_view_wizard_amazon_import_orders)d" string="Import Orders" type="action" class="oe_highlight"/>
+                    <group><button name="%(action_view_wizard_amazon_import_orders)d" string="Import Orders" type="action" class="oe_highlight"/></group>
+                    <group><button name="%(action_view_wizard_amazon_import_order)d" string="Import Order" type="action" class="oe_highlight"/></group>
+                    <group><button name="%(action_view_wizard_amazon_update_orders)d" string="Update Orders" type="action" class="oe_highlight"/></group>
                 </footer>
             </form>
         </field>

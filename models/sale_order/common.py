@@ -4,18 +4,16 @@
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
 import logging
-import xmlrpclib
+import random
 import math
+from xml import etree
 
 import odoo.addons.decimal_precision as dp
 from odoo import models, fields, api, _, exceptions
 from odoo.addons.component.core import Component
-from odoo.addons.connector.exception import IDMissingInBackend
-from odoo.addons.queue_job.exception import FailedJobError, RetryableJobError
+from odoo.addons.queue_job.exception import RetryableJobError, FailedJobError
 from odoo.addons.queue_job.job import job
 from odoo.exceptions import UserError
-
-from ...components.backend_adapter import AMAZON_DATETIME_FORMAT
 
 _logger = logging.getLogger(__name__)
 
@@ -98,14 +96,21 @@ class AmazonSaleOrder(models.Model):
     @api.multi
     def export_state_change(self, allowed_states=None,
                             comment=None, notify=None):
-        # TODO develop a wizard that can cancel the order
-        raise exceptions.except_orm('Error', 'This method need will be developed, you need to go to the odoo to cancel de order')
+        """ Change state of a sales order on Amazon """
+        self.ensure_one()
+        with self.backend_id.work_on(self._name) as work:
+            exporter = work.component(usage='sale.state.exporter')
+            return exporter.run(self, allowed_states=allowed_states,
+                                comment=comment, notify=notify)
 
     @job(default_channel='root.amazon')
     @api.model
     def import_batch(self, backend, filters=None):
         _super = super(AmazonSaleOrder, self)
-        return _super.import_batch(backend, filters=filters)
+        result = _super.import_batch(backend, filters=filters)
+        if result and isinstance(result, Exception):
+            raise result
+        return result
 
     @job(default_channel='root.amazon')
     @api.model
@@ -113,7 +118,11 @@ class AmazonSaleOrder(models.Model):
         _super = super(AmazonSaleOrder, self)
         result = _super.import_record(backend, external_id)
         if not result:
-            raise RetryableJobError("The sale of the backend %s hasn\'t could not be imported.\n %s", backend.name, external_id, 60)
+            raise RetryableJobError(msg="The sale of the backend %s hasn\'t could not be imported.\n %s" % (backend.name, external_id),
+                                    seconds=random.randint(90, 600))
+
+        if isinstance(result, Exception):
+            raise Exception(result)
 
     @api.depends('amazon_order_line_ids.fee')
     def _compute_order_fee(self):
@@ -162,44 +171,9 @@ class SaleOrder(models.Model):
             if amazon_order.amazon_parent_id:
                 self.parent_id = amazon_order.amazon_parent_id.odoo_id
 
-    def _amazon_cancel(self):
-        """ Cancel sales order on Amazon
-
-        Do not export the other state changes, Amazon handles them itself
-        when it receives shipments and invoices.
-        """
-        for order in self:
-            old_state = order.state
-            if old_state == 'cancel':
-                continue  # skip if already canceled
-            for binding in order.amazon_bind_ids:
-                job_descr = _("Cancel sales order %s") % (binding.external_id,)
-                binding.with_delay(
-                    description=job_descr
-                ).export_state_change(allowed_states=['cancel'])
-
     @api.multi
     def write(self, vals):
-        if vals.get('state') == 'cancel':
-            self._amazon_cancel()
         return super(SaleOrder, self).write(vals)
-
-    def _amazon_link_binding_of_copy(self, new):
-        # link binding of the canceled order to the new order, so the
-        # operations done on the new order will be sync'ed with Amazon
-        if self.state != 'cancel':
-            return
-        binding_model = self.env['amazon.sale.order']
-        bindings = binding_model.search([('odoo_id', '=', self.id)])
-        bindings.write({'odoo_id':new.id})
-
-        for binding in bindings:
-            # the sales' status on Amazon is likely 'canceled'
-            # so we will export the new status (pending, processing, ...)
-            job_descr = _("Reopen sales order %s") % (binding.external_id,)
-            binding.with_delay(
-                description=job_descr
-            ).export_state_change()
 
     @api.multi
     def copy(self, default=None):

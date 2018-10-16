@@ -10,3 +10,4 @@ from . import sale_order
 from . import return_order
 from . import report
 from . import partner
+from . import feeds

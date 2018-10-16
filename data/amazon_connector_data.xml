@@ -28,16 +28,16 @@
             <field eval="'()'" name="args"/>
         </record>
 
-        <record model="ir.cron" id="ir_cron_update_product_prices" forcecreate="True">
-            <field name="name">Amazon -  Update Prices</field>
+        <record model="ir.cron" id="ir_cron_update_product_stock_prices" forcecreate="True">
+            <field name="name">Amazon -  Update Stock and Prices</field>
             <field eval="False" name="active"/>
             <field name="user_id" ref="base.user_root"/>
-            <field name="interval_number">5</field>
+            <field name="interval_number">15</field>
             <field name="interval_type">minutes</field>
             <field name="numbercall">-1</field>
             <field eval="False" name="doall"/>
             <field eval="'amazon.backend'" name="model"/>
-            <field eval="'_scheduler_update_product_prices'" name="function"/>
+            <field eval="'_scheduler_update_product_prices_stock_qty'" name="function"/>
             <field eval="'()'" name="args"/>
         </record>
 

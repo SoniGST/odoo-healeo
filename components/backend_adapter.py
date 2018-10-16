@@ -8,6 +8,7 @@ import StringIO
 import logging
 import dateutil.parser
 import re
+from lxml import etree
 
 import unicodecsv
 from odoo.fields import Datetime
@@ -35,6 +36,7 @@ AMAZON_ORDER_ID_PATTERN = '^([\d]{3}-[\d]{7}-[\d]{7})+$'
 AMAZON_SUBMIT_REPORT_METHOD_DICT = {'submit_inventory_request':'_GET_MERCHANT_LISTINGS_ALL_DATA_',
                                     'submit_sales_request':'_GET_FLAT_FILE_ORDERS_DATA_',
                                     'submit_updated_sales_request':'_GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_'}
+
 AMAZON_METHOD_LIST = ['get_inventory',
                       'get_sales',
                       'list_items_from_order',
@@ -44,6 +46,9 @@ AMAZON_METHOD_LIST = ['get_inventory',
                       'amazon_sale_order_read',
                       'amazon_sale_order_search',
                       'amazon_product_product_read',
+                      'submit_stock_update',
+                      'submit_price_update',
+                      'submit_stock_price_handling_update',
                       ]
 
 
@@ -66,6 +71,127 @@ class AmazonAPI(object):
             except:
                 return ''
         return ''
+
+    def _save_feed(self, response, params, xml_csv):
+        if response and response._response_dict and response._response_dict[response._rootkey] and response._response_dict[response._rootkey].get('FeedSubmissionInfo'):
+            info_feed = response._response_dict[response._rootkey].get('FeedSubmissionInfo')
+            vals = {'id_feed_submision':info_feed.getvalue('FeedSubmissionId'),
+                    'type':info_feed.getvalue('FeedType'),
+                    'submitted_date':info_feed.getvalue('SubmittedDate'),
+                    'feed_processing_status':info_feed.getvalue('FeedProcessingStatus'),
+                    'params':params.encode('utf8') if params else None,
+                    'xml_csv':xml_csv.decode('utf8') if xml_csv else None,
+                    'backend_id':self._backend.id}
+
+            self._backend.env['amazon.feed'].create(vals)
+
+
+    def _submit_stock_update(self, arguments):
+        feedsApi = Feeds(backend=self._backend)
+
+        top = etree.Element('AmazonEnvelope')
+
+        header = etree.SubElement(top, 'Header')
+        docVersion = etree.SubElement(header, 'DocumentVersion')
+        docVersion.text = '1.01'
+        merchantId = etree.SubElement(header, 'MerchantIdentifier')
+        merchantId.text = self._backend.token
+
+        messageType = etree.SubElement(top, 'MessageType')
+        messageType.text = 'Inventory'
+
+        dict_products = arguments
+
+
+        '''
+        Dict structure
+        dict_products = [{'sku': 'D5-0BJZ-39B4', 'Quantity': 2, 'id_mws':'A1RKKUPIHCS9HS'},
+                         {'sku': 'CH-N74Z-DD0S', 'Quantity': 5,'id_mws':'A1RKKUPIHCS9HS'},
+                         {'sku': '9P-NBB6-095H', 'Quantity': 4, 'id_mws': 'A1RKKUPIHCS9HS'}]
+        '''
+        for market in self._backend.marketplace_ids:
+            products = filter(lambda x:x['id_mws'] == market.id_mws, dict_products)  # Output: [{'name': 'python', 'points': 10}]
+
+            i = 1
+
+            for product in products:
+                message = etree.SubElement(top, 'Message')
+                messageID = etree.SubElement(message, 'MessageID')
+                messageID.text = str(i)
+                i=+1
+
+                operationType = etree.SubElement(message, 'OperationType')
+                operationType.text = 'Update'
+
+                inventory = etree.SubElement(message, 'Inventory')
+
+                sku = etree.SubElement(inventory, 'SKU')
+                sku.text = product['sku']
+                quantity = etree.SubElement(inventory, 'Quantity')
+                quantity.text = str(product['Quantity'])
+
+            xml = etree.tostring(top, pretty_print=True, xml_declaration=True, encoding='UTF-8')
+
+            xml = xml.replace('<AmazonEnvelope>',
+                              '<AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">')
+
+
+            response = feedsApi.submit_feed(feed=xml,
+                                            feed_type='_POST_INVENTORY_AVAILABILITY_DATA_',
+                                            marketplaceids=[market.id_mws])
+
+            self._save_feed(response=response, params=str(arguments), xml_csv=xml)
+
+    def _submit_price_update(self, arguments):
+        feedsApi = Feeds(backend=self._backend)
+
+        top = etree.Element('AmazonEnvelope')
+
+        header = etree.SubElement(top, 'Header')
+        docVersion = etree.SubElement(header, 'DocumentVersion')
+        docVersion.text = '1.01'
+        merchantId = etree.SubElement(header, 'MerchantIdentifier')
+        merchantId.text = self._backend.token
+
+        messageType = etree.SubElement(top, 'MessageType')
+        messageType.text = 'Price'
+
+        dict_products = arguments
+
+        '''
+        Dict structure
+        dict_products = [{'sku': 'D5-0BJZ-39B4', 'price': '84.80', currency:'EUR', 'id_mws':'A1RKKUPIHCS9HS'},
+                         {'sku': 'CH-N74Z-DD0S', 'price': '24,45', currency:'EUR', 'id_mws':'A1RKKUPIHCS9HS'}]
+        '''
+        for market in self._backend.marketplace_ids:
+            products = filter(lambda x:x['id_mws'] == market.id_mws, dict_products)  # Output: [{'name': 'python', 'points': 10}]
+
+            for product in products:
+                message = etree.SubElement(top, 'Message')
+                messageID = etree.SubElement(message, 'MessageID')
+                messageID.text = '1'
+
+                operationType = etree.SubElement(message, 'OperationType')
+                operationType.text = 'Update'
+
+                price = etree.SubElement(message, 'Price')
+
+                sku = etree.SubElement(price, 'SKU')
+                sku.text = product['sku']
+                standar_price = etree.SubElement(price, 'StandardPrice')
+                standar_price.text = product['price']
+                standar_price.set('currency', product['currency'])
+
+            xml = etree.tostring(top, pretty_print=True, xml_declaration=True, encoding='UTF-8')
+
+            xml = xml.replace('<AmazonEnvelope>',
+                              '<AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">')
+
+            response = feedsApi.submit_feed(feed=xml,
+                                            feed_type='_POST_PRODUCT_PRICING_DATA_',
+                                            marketplaceids=[market.id_mws])
+
+            self._save_feed(response=response, params=str(arguments), xml_csv=xml)
 
     def _submit_report(self, method, arguments=None):
         try:
@@ -96,9 +222,10 @@ class AmazonAPI(object):
 
             return {'report_ids':report_ids}
 
-        except:
+
+        except Exception as e:
             _logger.error("report_api(%s.%s) failed", '_submit_report', method)
-            return
+            return e
 
     def _get_report_list_ids(self, report_ids):
         try:
@@ -110,9 +237,9 @@ class AmazonAPI(object):
                     response._response_dict[response._rootkey].get('ReportInfo') and \
                     response._response_dict[response._rootkey]['ReportInfo'].get('ReportId'):
                 return response._response_dict[response._rootkey]['ReportInfo']['ReportId']['value']
-        except:
+        except Exception as e:
             _logger.error("report_api(%s) failed with report_ids %s", '_get_report_list_ids ', report_ids)
-            return
+            raise e
 
         return
 
@@ -125,9 +252,11 @@ class AmazonAPI(object):
                 return response
         except MWSError as e:
             _logger.error("report_api(%s) failed with report_ids %s", '_get_report ', report_list_id)
-            if len(e.args) and e.args[0].lower().index('Request is throttled'):
+            if len(e.args) and e.args[0].lower().index('request is throttled'):
                 raise RetryableJobError(msg='The request to get_report is throttled, we must wait 5 minutes', seconds=300, ignore_retry=True)
             raise FailedJobError('The request to get report failed: report_list_id: %s (%s)', report_list_id, e.args[0] if len(e.args) and e.args[0] else '')
+        except Exception as e:
+            raise e
 
     def _get_parent_category(self, dict_category):
         if dict_category.get('Parent'):
@@ -174,9 +303,10 @@ class AmazonAPI(object):
 
                 if product.get('is_mine_lowest_price') == None:
                     product['is_mine_lowest_price'] = True
-        except:
+        except Exception as e:
             _logger.error("Recovering lowest prices from product_api (%s) failed with sku %s and marketplace %s",
                           '_get_product_data ', sku, marketplace_id)
+            raise e
 
         return product
 
@@ -209,9 +339,10 @@ class AmazonAPI(object):
                     product['length'] = dimensions.get('Length')
                     product['width'] = dimensions.get('Width')
                     product['weight'] = dimensions.get('Weight')
-        except:
+        except Exception as e:
             _logger.error("Recovering main data from product_api (%s) failed with sku %s and marketplace %s", 'get_matching_product_for_id', sku,
                           marketplace_id)
+            raise e
 
         return product
 
@@ -235,9 +366,9 @@ class AmazonAPI(object):
                 product['currency_price_unit'] = offer['BuyingPrice']['ListingPrice'].getvalue('CurrencyCode')
                 product['price_shipping'] = offer['BuyingPrice']['Shipping'].getvalue('Amount')
                 product['currency_shipping'] = offer['BuyingPrice']['Shipping'].getvalue('CurrencyCode')
-        except:
+        except Exception as e:
             _logger.error("Recovering price's product from product_api (%s) failed with sku %s and marketplace %s", 'get_my_price_for_sku', sku, marketplace_id)
-            # raise
+            raise e
 
         return product
 
@@ -255,9 +386,9 @@ class AmazonAPI(object):
                     product['category_name'] = self._get_parent_category(response._response_dict[response._rootkey]['Self'][0])
                 else:
                     product['category_name'] = self._get_parent_category(response._response_dict[response._rootkey]['Self'])
-        except:
+        except Exception as e:
             _logger.error("Recovering category from product_api (%s) failed with sku %s and marketplace %s", '_get_product_data ', sku, marketplace_id)
-            # raise
+            raise e
 
             return self._get_lowest_price_and_buybox(marketplace_id, sku, product_api, product)
 
@@ -319,8 +450,10 @@ class AmazonAPI(object):
         if with_items:
             try:
                 self._list_items_from_order(order)
-            except:
-                _logger.error("Getting list items order from order_api (%s) failed with id_order %s", '_get_order_data_from_dict', order['order_id'])
+            except Exception as e:
+                _logger.error("Getting list items order from order_api (%s) failed with id_order %s (%s)", '_get_order_data_from_dict',
+                              order['order_id'],
+                              e.message)
 
         return order
 
@@ -390,62 +523,80 @@ class AmazonAPI(object):
         return orders
 
     def _list_orders(self, arguments):
-        orders_api = Orders(backend=self._backend)
-        marketplace_ids = arguments.get('marketplace_ids') or self._backend._get_crypt_codes_marketplaces()
-        order_status = arguments.get('order_status') or self._backend.env['amazon.config.order.status'].search([]).mapped('name')
-        date_start = None
-        date_end = None
-        last_update_start = None
-        last_update_end = None
-        if arguments:
-            if arguments.get('date_start'):
-                date_start = arguments['date_start']
-            if arguments.get('date_end'):
-                date_end = arguments['date_end']
-            if arguments.get('update_start'):
-                last_update_start = arguments['update_start']
-            if arguments.get('update_end'):
-                last_update_end = arguments['update_end']
-
-        response = orders_api.list_orders(marketplaceids=marketplace_ids,
-                                          orderstatus=order_status,
-                                          created_before=date_end,
-                                          created_after=date_start,
-                                          lastupdatedbefore=last_update_end,
-                                          lastupdatedafter=last_update_start)
-        orders = {}
-        if response and response._response_dict and response._response_dict[response._rootkey] and response._response_dict[response._rootkey].get('Orders') and \
-                response._response_dict[response._rootkey]['Orders'].get('Order'):
-            # If the result have one item, the result is a dict, however if the result have more than one item the result is a list
-            orders_dict = response._response_dict[response._rootkey]['Orders']['Order']
-            orders_dict = orders_dict if isinstance(orders_dict, list) else [orders_dict]
-            for order in orders_dict:
-                aux = self._get_order_data_from_dict(order)
-                if aux:
-                    orders[aux['order_id']] = aux
-
-            if response._response_dict[response._rootkey].get('NextToken'):
-                new_orders = self._list_orders_next_token(arguments={'NextToken':response._response_dict[response._rootkey]['NextToken']['value']},
-                                                          orders_api=orders_api)
-
-                orders.update(new_orders)
-
-        return orders
-
-    def _get_order(self, id_order, with_items=True):
-        orders_api = Orders(backend=self._backend)
-
         try:
-            response = orders_api.get_order(amazon_order_ids=[id_order])
+            orders_api = Orders(backend=self._backend)
+            marketplace_ids = arguments.get('marketplace_ids') or self._backend._get_crypt_codes_marketplaces()
+            order_status = None
+            date_start = None
+            date_end = None
+            last_update_start = None
+            last_update_end = None
+            if arguments:
+                if arguments.get('date_start'):
+                    date_start = arguments['date_start']
+                if arguments.get('date_end'):
+                    date_end = arguments['date_end']
+                if arguments.get('update_start'):
+                    last_update_start = arguments['update_start']
+                if arguments.get('update_end'):
+                    last_update_end = arguments['update_end']
+                if arguments.get('order_status'):
+                    order_status = arguments['order_status']
+
+            if not order_status:
+                order_status = arguments.get('order_status') or self._backend.env['amazon.config.order.status'].search([]).mapped('name')
+
+            response = orders_api.list_orders(marketplaceids=marketplace_ids,
+                                              orderstatus=order_status,
+                                              created_before=date_end,
+                                              created_after=date_start,
+                                              lastupdatedbefore=last_update_end,
+                                              lastupdatedafter=last_update_start)
+            orders = {}
+            if response and response._response_dict and response._response_dict[response._rootkey] and response._response_dict[response._rootkey].get(
+                    'Orders') and \
+                    response._response_dict[response._rootkey]['Orders'].get('Order'):
+                # If the result have one item, the result is a dict, however if the result have more than one item the result is a list
+                orders_dict = response._response_dict[response._rootkey]['Orders']['Order']
+                orders_dict = orders_dict if isinstance(orders_dict, list) else [orders_dict]
+                for order in orders_dict:
+                    aux = self._get_order_data_from_dict(order)
+                    if aux:
+                        orders[aux['order_id']] = aux
+
+                if response._response_dict[response._rootkey].get('NextToken'):
+                    new_orders = self._list_orders_next_token(arguments={'NextToken':response._response_dict[response._rootkey]['NextToken']['value']},
+                                                              orders_api=orders_api)
+
+                    orders.update(new_orders)
+
+            return orders
+        except Exception as e:
+            raise e
+
+    def _get_order(self, order_ids, with_items=True):
+        orders_api = Orders(backend=self._backend)
+        orders = []
+        try:
+            if not isinstance(order_ids, (list, tuple)):
+                order_ids = (order_ids)
+            response = orders_api.get_order(amazon_order_ids=order_ids)
             if response and response._response_dict and response._response_dict[response._rootkey] and \
                     response._response_dict[response._rootkey].get('Orders') and response._response_dict[response._rootkey]['Orders'].get('Order'):
-                order_dict = response._response_dict[response._rootkey]['Orders']['Order']
-                response._response_dict[response._rootkey]['Orders']['Order']
-                return self._get_order_data_from_dict(order_dict)
+                orders_dict = response._response_dict[response._rootkey]['Orders']['Order']
+                orders_dict = orders_dict if isinstance(orders_dict, list) else [orders_dict]
+                for order_dict in orders_dict:
+                    orders.append(self._get_order_data_from_dict(order_dict, with_items=with_items))
 
-        except:
-            _logger.error("Getting order from order_api (%s) failed with id_order %s", '_get_order', id_order)
-            raise
+                if len(orders) > 1:
+                    return orders
+                elif len(orders) == 1:
+                    orders[0]
+
+
+        except Exception as e:
+            _logger.error("Getting order from order_api (%s) failed with id_order %s", '_get_order', str(order_ids))
+            raise e
 
     def _get_header_product_fieldnames(self, marketplace):
         '''
@@ -509,15 +660,15 @@ class AmazonAPI(object):
     def _get_data_report(self, report_id, headers):
         try:
             assert report_id
-        except AssertionError:
+        except AssertionError, e:
             _logger.error("report_api('%s') failed", '_get_data_report.report_id')
-            raise
+            raise e
 
         try:
             assert headers
-        except AssertionError:
+        except AssertionError, e:
             _logger.error("report_api('%s') failed", '_get_data_report.headers')
-            raise
+            raise e
 
         rep_list_id = self._get_report_list_ids(report_id)
         # If there isn't the rep_list_id, we assume that there aren't data and the report had not been created
@@ -763,7 +914,7 @@ class AmazonAPI(object):
         return self._list_orders(arguments=arguments)
 
     def _amazon_sale_order_read(self, arguments):
-        return self._get_order(id_order=arguments)
+        return self._get_order(order_ids=arguments)
 
     def _amazon_product_product_read(self, arguments):
         return self._get_product_data(sku=arguments[0], marketplace_id=arguments[1])
@@ -779,15 +930,17 @@ class AmazonAPI(object):
     def call(self, method, arguments):
         try:
             assert method
-            try:
-                return self._api(method, arguments)
-            except:
-                _logger.error("api('%s', %s) failed", method, arguments)
-                raise
-
-        except AssertionError:
+        except AssertionError as ase:
             _logger.log(logging.DEBUG, 'The method on AmazonAPI call is empty %s', self.name)
-            return
+            return ase
+
+        try:
+            return self._api(method, arguments)
+        except MWSError as mwse:
+            raise RetryableJobError('A error has been produced on MWS API', ignore_retry='RequestThrottled' in mwse.message, seconds=90)
+        except Exception as e:
+            _logger.error("api('%s', %s) failed", method, arguments)
+            raise e
 
 
 class AmazonCRUDAdapter(AbstractComponent):
@@ -864,7 +1017,10 @@ class GenericAdapter(AbstractComponent):
 
         :rtype: dict
         """
-        arguments = [external_id]
+        if external_id and isinstance(external_id, (list, tuple)):
+            arguments = external_id
+        else:
+            arguments = [external_id]
         if attributes:
             arguments.append(attributes)
         return self._call('%s_read' % self._get_model().replace('.', '_'), [arguments])

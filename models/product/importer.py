@@ -12,6 +12,7 @@ from odoo import _
 from odoo.addons.component.core import Component
 from odoo.addons.connector.components.mapper import mapping
 from odoo.addons.connector.exception import InvalidDataError
+from odoo.addons.queue_job.exception import FailedJobError
 
 from ...components.mapper import normalize_datetime
 
@@ -68,7 +69,6 @@ class ProductImporter(Component):
         """ Return the raw Amazon data for ``self.external_id`` """
         if self.amazon_record:
             return self.amazon_record
-
         product = {'sku':self.external_id}
         default_market = self.backend_record._get_marketplace_default()
         product['marketplace_id'] = default_market.id
@@ -87,10 +87,12 @@ class ProductImporter(Component):
                     product['name'] = data_market['title']
 
         # If I need to explain you the sense of the next code I would have to kill you
-        market_match = map(lambda x:x['marketplace_id'] == product['marketplace_id'], product['product_product_market_ids'])
-        if not market_match and product.get('product_product_market_ids'):
-            product['marketplace_id'] = product['product_product_market_ids'][0]['marketplace_id']
-        product['marketplace'] = self.env['amazon.config.marketplace'].browse(product['marketplace_id'])
+        if product.get('product_product_market_ids'):
+            market_match = map(lambda x:x['marketplace_id'] == product['marketplace_id'], product['product_product_market_ids'])
+            if not market_match and product.get('product_product_market_ids'):
+                product['marketplace_id'] = product['product_product_market_ids'][0]['marketplace_id']
+        if product.get('marketplace_id'):
+            product['marketplace'] = self.env['amazon.config.marketplace'].browse(product['marketplace_id'])
 
         return product
 
@@ -259,7 +261,7 @@ class ProductImporter(Component):
 
     def _before_import(self):
         # Get our product price on marketplace
-        if self.amazon_record and self.amazon_record['product_product_market_ids']:
+        if self.amazon_record and self.amazon_record.get('product_product_market_ids'):
             rce = self.env['res.currency']
             for product_market in self.amazon_record['product_product_market_ids']:
                 marketplace = self.env['amazon.config.marketplace'].browse(self.amazon_record['marketplace_id'])
@@ -273,6 +275,9 @@ class ProductImporter(Component):
                                                       self.env.user.company_id.currency_id.id or \
                                                       self.env.ref('base.EUR').id
 
+        if not self.amazon_record.get('sku') or not self.amazon_record.get('name'):
+            raise FailedJobError('The product can\'t be imported %s' % self.amazon_record['sku'] if self.amazon_record.get('sku') else '')
+
     def _is_uptodate(self, binding):
         if binding:
             return True
@@ -281,7 +286,7 @@ class ProductImporter(Component):
         """ Hook called at the end of the import """
         if self.amazon_record and self.amazon_record.get('marketplace_id'):
             self._write_product_data(binding, self.amazon_record.get('marketplace'))
-            importer = self.component(usage='amazon.product.update.listprice')
+            importer = self.component(usage='amazon.assign.product.listprice')
             for sub_binding in binding.product_product_market_ids:
                 importer.run(sub_binding)
 
@@ -296,15 +301,16 @@ class ProductImporter(Component):
         :param external_id: identifier of the record on Amazon
         """
         if isinstance(external_id, (list, tuple)) and len(external_id) > 1:
-            self.external_id = external_id[0]
+            self.external_id = external_id[0].encode('utf8')
             self.amazon_record = external_id[1]
             if self.amazon_record and self.amazon_record.get('marketplace_id'):
                 self.amazon_record['marketplace'] = self.env['amazon.config.marketplace'].browse(self.amazon_record['marketplace_id'])
                 self.amazon_record['marketplace_name'] = self.amazon_record['marketplace'].name
         else:
-            self.external_id = external_id
+            self.external_id = external_id.encode('utf8')
         _super = super(ProductImporter, self)
-        return _super.run(external_id=external_id[0].encode('utf8'), force=force)
+
+        return _super.run(external_id=self.external_id, force=force)
 
 
 class ProductProductMarketImportMapper(Component):
@@ -337,22 +343,32 @@ class ProductProductMarketImportMapper(Component):
 
     @mapping
     def item_ids(self, record):
-        import_start_time = datetime.now()
-        item = [[0,
-                 0,
-                 {'applied_on':'1_product',
-                  'compute_price':'fixed',
-                  'min_quantity':1,
-                  'date_start':import_start_time.isoformat(),
-                  'fixed_price':record.get('price_unit'), }],
-                [0,
-                 0,
-                 {'applied_on':'1_product',
-                  'compute_price':'fixed',
-                  'min_quantity':1,
-                  'date_start':import_start_time.isoformat(),
-                  'fixed_price':record.get('price_shipping'), }]
-                ]
+        pricelist = self.env['product.pricelist'].search([('sku', '=', record['sku']), ('marketplace_price_id', '=', record['marketplace_id'])])
+
+        now_time = datetime.now()
+        item = []
+        if pricelist:
+            for prc_item in pricelist.item_ids:
+                if not prc_item.date_end:
+                    item.append([1,
+                                 prc_item.id,
+                                 {'date_end':now_time.isoformat(), }])
+
+        # The product type 'product' is the product to sell
+        item.append([0,
+                     0,
+                     {'applied_on':'1_product',
+                      'compute_price':'fixed',
+                      'min_quantity':1,
+                      'date_start':now_time.isoformat(),
+                      'fixed_price':record.get('price_unit'), }])
+        item.append([0,
+                     0,
+                     {'applied_on':'1_product',
+                      'compute_price':'fixed',
+                      'min_quantity':1,
+                      'date_start':now_time.isoformat(),
+                      'fixed_price':record.get('price_shipping'), }])
 
         return {'item_ids':item}
 
@@ -469,24 +485,47 @@ class ProductLowestPriceImporter(Component):
                     self._update_lowest_price(product_detail, data)
 
 
-class ProductPricelistImporter(Component):
+class ProductAssignPricelistImporter(Component):
     '''
     Importer to recover the price product and price ship and write it on pricelist
     '''
-    _name = 'amazon.product.pricelist.importer'
+    _name = 'amazon.assign.product.pricelist.importer'
     _inherit = 'amazon.importer'
     _apply_on = ['amazon.product.product']
-    _usage = 'amazon.product.update.listprice'
+    _usage = 'amazon.assign.product.listprice'
 
-    def _update_pricelist(self, binding):
+    def _assign_product_pricelist(self, binding):
         com_ship = self.component(usage='order.line.builder.shipping')
         ship_service = com_ship.env.ref('.'.join(com_ship.product_ref))
+        product_id_done = False
         for item in binding.odoo_id.item_ids:
-            if binding.price == item.fixed_price:
-                item.write({'product_tmpl_id':binding.product_id.odoo_id.product_tmpl_id.id})
-            elif binding.price_ship == item.fixed_price:
-                item.write({'product_tmpl_id':ship_service.product_tmpl_id.id})
+            if not item.date_end:
+                if not product_id_done and binding.price == item.fixed_price:
+                    item.write({'product_tmpl_id':binding.product_id.odoo_id.product_tmpl_id.id})
+                    product_id_done = True
+                elif binding.price_ship == item.fixed_price:
+                    item.write({'product_tmpl_id':ship_service.product_tmpl_id.id})
 
     def run(self, binding):
         if binding and binding.odoo_id:
-            self._update_pricelist(binding)
+            self._assign_product_pricelist(binding)
+
+
+class ProductPriceImporter(Component):
+    """ Import data for a record.
+
+        Usually called from importers, in ``_after_import``.
+        For instance from the products importer.
+    """
+
+    _name = 'amazon.product.price.importer'
+    _inherit = 'amazon.importer'
+    _apply_on = ['amazon.product.product']
+    _usage = 'amazon.product.price'
+
+    def run_importer(self, binding):
+        prices = self.backend_adapter.get_my_price([binding.sku, binding.marketplace_id.id_mws])
+        return prices
+
+    def run_exporter(self, binding):
+        return

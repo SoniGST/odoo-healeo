@@ -5,11 +5,10 @@
 # This project is based on connector-magneto, developed by Camptocamp SA
 
 import logging
-from collections import defaultdict
 
 from odoo import models, fields, api
 from odoo.addons.component.core import Component
-from odoo.addons.queue_job.job import job, related_action
+from odoo.addons.queue_job.job import job
 
 _logger = logging.getLogger(__name__)
 

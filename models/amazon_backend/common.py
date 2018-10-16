@@ -6,8 +6,7 @@ import logging
 from datetime import datetime, timedelta
 
 from decorator import contextmanager
-from odoo import models, fields, api, _
-from odoo.exceptions import UserError
+from odoo import models, fields, api
 from odoo.addons.connector.checkpoint import checkpoint
 
 from ...components.backend_adapter import AmazonAPI
@@ -31,6 +30,8 @@ class AmazonBackend(models.Model):
     region = fields.Many2one('res.country', 'region', required=True, related='company_id.country_id')  # Region of the marketplaces that the account belongs
 
     no_sales_order_sync = fields.Boolean(string='Sync sales order', readonly=True)
+
+    stock_sync = fields.Boolean(string='Sync stock products', default=False)
 
     warehouse_id = fields.Many2one(
         comodel_name='stock.warehouse',
@@ -91,6 +92,11 @@ class AmazonBackend(models.Model):
     team_id = fields.Many2one(comodel_name='crm.team', string='Sales Team')
 
     marketplace_ids = fields.Many2many(comodel_name='amazon.config.marketplace', string='Markerplaces of backend')
+
+    # Min and max margin stablished for the calculation of the price on product and product price details if these do not be informed
+    change_prices = fields.Boolean('Change the prices', default=False)
+    min_margin = fields.Float('Minimal margin', default=None)
+    max_margin = fields.Float('Minimal margin', default=None)
 
     _sql_constraints = [
         ('sale_prefix_uniq', 'unique(sale_prefix)',
@@ -162,26 +168,32 @@ class AmazonBackend(models.Model):
         return True
 
     @api.multi
-    def _import_sale_orders(self, import_start_time=None, import_end_time=datetime.now(), generate_report=False):
+    def _import_sale_orders(self,
+                            import_start_time=None,
+                            import_end_time=None,
+                            generate_report=False,
+                            update_import_date=True):
+
         for backend in self:
             user = backend.warehouse_id.company_id.user_tech_id
             if not user:
                 user = self.env['res.users'].browse(self.env.uid)
 
+            if not backend.import_updated_sales_from_date:
+                backend.import_updated_sales_from_date = backend.import_sales_from_date
+
+            if not import_end_time:
+                import_end_time = datetime.strptime(datetime.today().strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S') - timedelta(minutes=2)
+
+            # If the start date to get sales is empty we put now as date
+            if not import_start_time:
+                if backend.import_sales_from_date:
+                    import_start_time = datetime.strptime(backend.import_sales_from_date, '%Y-%m-%d %H:%M:%S')
+                else:
+                    import_start_time = import_end_time
+
             if generate_report:
                 report_binding_model = self.env['amazon.report']
-                if user != self.env.user:
-                    report_binding_model = report_binding_model.sudo(user)
-
-                if not backend.import_updated_sales_from_date:
-                    backend.import_updated_sales_from_date = backend.import_sales_from_date
-
-                # If the start date to get sales is empty we put now as date
-                if import_start_time == None:
-                    if backend.import_sales_from_date:
-                        import_start_time = datetime.strptime(backend.import_sales_from_date, '%Y-%m-%d %H:%M:%S')
-                    else:
-                        import_start_time = import_end_time
 
                 filters = {'method':'submit_sales_request'}
                 filters['date_start'] = import_start_time.isoformat()
@@ -191,36 +203,59 @@ class AmazonBackend(models.Model):
                 if report_id:
                     delayable = report_binding_model.with_delay(priority=5, eta=datetime.now() + timedelta(minutes=5))
                     filters = {'method':'get_sales'}
-                    filters['report_id'] = report_id['report_ids']
+                    filters['report_id'] = [report_id['report_ids']]
                     delayable.import_batch(backend, filters=filters)
-                    backend.write({'import_sales_from_date':import_end_time})
-
             else:
                 sale_binding_model = self.env['amazon.sale.order']
-                sale_binding_model.import_batch(backend, filters={'date_start':import_start_time.isoformat(), 'date_end':import_end_time.isoformat()})
-                return True
+                if user != self.env.user:
+                    sale_binding_model = sale_binding_model.sudo(user)
+                filters = {'date_start':import_start_time.isoformat(), 'date_end':import_end_time.isoformat()}
+                sale_binding_model.import_batch(backend, filters=filters)
+
+            if update_import_date:
+                backend.write({'import_sales_from_date':import_end_time})
 
         return True
 
     @api.multi
-    def _import_updated_sales(self, import_start_time=None, import_end_time=datetime.now()):
-        for backend in self:
-            if import_start_time == None:
-                if backend.import_sales_from_date:
-                    import_start_time = datetime.strptime(backend.import_updated_sales_from_date, '%Y-%m-%d %H:%M:%S')
-                else:
-                    import_start_time = import_end_time
-            sale_binding_model = self.env['amazon.sale.order']
-            sale_binding_model.import_batch(backend, filters={'update_start':import_start_time.isoformat(), 'update_end':import_end_time.isoformat()})
-            backend.write({'import_updated_sales_from_date':import_end_time})
+    def _import_updated_sales(self,
+                              import_start_time=None,
+                              import_end_time=None,
+                              update_import_date=True):
 
-    @api.model
-    def _update_product_prices(self):
-        export_end_time = datetime.now()
         for backend in self:
             user = backend.warehouse_id.company_id.user_tech_id
             if not user:
                 user = self.env['res.users'].browse(self.env.uid)
+            sale_binding_model = self.env['amazon.sale.order']
+            if user != self.env.user:
+                sale_binding_model = sale_binding_model.sudo(user)
+
+            if not import_end_time:
+                # We minus two minutes to now time
+                import_end_time = datetime.strptime(datetime.today().strftime('%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S') - timedelta(minutes=2)
+            if not import_start_time:
+                if backend.import_sales_from_date:
+                    import_start_time = datetime.strptime(backend.import_updated_sales_from_date, '%Y-%m-%d %H:%M:%S')
+                else:
+                    import_start_time = import_end_time
+
+            sale_binding_model.import_batch(backend, filters={'update_start':import_start_time.isoformat(),
+                                                              'update_end':import_end_time.isoformat(),
+                                                              'update_sales_flag':True})
+            if update_import_date:
+                backend.write({'import_updated_sales_from_date':import_end_time})
+
+    @api.model
+    def _update_product_stock_qty_prices(self):
+        for backend in self:
+            user = backend.warehouse_id.company_id.user_tech_id
+            if not user:
+                user = self.env['res.users'].browse(self.env.uid)
+            product_binding_model = self.env['amazon.product.product']
+            if user != self.env.user:
+                product_binding_model = product_binding_model.sudo(user)
+            product_binding_model.export_batch(backend)
 
     @api.model
     def _amazon_backend(self, callback, domain=None):
@@ -240,9 +275,5 @@ class AmazonBackend(models.Model):
         self._amazon_backend('_import_product_product', domain=domain)
 
     @api.model
-    def _scheduler_update_product_stock_qty(self, domain=None):
-        self._amazon_backend('update_product_stock_qty', domain=domain)
-
-    @api.model
-    def _scheduler_update_product_prices(self, domain=None):
-        self._amazon_backend('_update_product_prices', domain=domain)
+    def _scheduler_update_product_prices_stock_qty(self, domain=None):
+        self._amazon_backend('_update_product_stock_qty_prices', domain=domain)
